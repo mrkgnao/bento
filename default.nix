@@ -10,6 +10,8 @@ stdenv.mkDerivation rec {
     virtualenv
     pip
     psutil
+    pyyaml
+    mpd2
 
     ipython
 

@@ -1,24 +1,20 @@
 import json
-import psutil
 import colorsys
+import yaml
 
 from functools import wraps
 
-from time import sleep
-
-
-class Bar(object):
-    def __init__(self, name):
-        self.name = name
-
 
 def bento_cmd(arg):
+    """
+    Everyday we stray further from Haskell's light
+    """
     if callable(arg):
 
         @wraps(arg)
-        def inner(name, *args, **kwargs):
-            d = arg(*args, **kwargs)
-            d['bar'] = name
+        def inner(self, *args, **kwargs):
+            d = arg(self, *args, **kwargs)
+            d['bar'] = self.bar_name
             d['cmd'] = arg.__name__
             return send_to_fifo(d)
 
@@ -27,105 +23,15 @@ def bento_cmd(arg):
 
         def _inner(func):
             @wraps(func)
-            def inner(name, *args, **kwargs):
-                d = func(*args, **kwargs)
-                d['bar'] = name
+            def inner(self, *args, **kwargs):
+                d = func(self, *args, **kwargs)
+                d['bar'] = self.bar_name
                 d['cmd'] = arg
                 send_to_fifo(d)
 
             return inner
 
         return _inner
-
-
-@bento_cmd('add_bar')
-def create_bar(x, y, width, height:str):
-    return {"x": x, "y": y, "width": width, "height": height}
-
-@bento_cmd('show')
-def show_bar():
-    """Show the target bar."""
-    return {}
-
-
-@bento_cmd('hide')
-def hide_bar():
-    """Hide the target bar."""
-    return {}
-
-
-@bento_cmd
-def set_text(text):
-    return {"text": text}
-
-
-@bento_cmd
-def set_font(font_desc):
-    return {"font_desc": font_desc}
-
-
-@bento_cmd
-def set_bg(red, green, blue):
-    return {"red": red, "green": green, "blue": blue}
-
-
-@bento_cmd
-def set_bg_norm(red, green, blue):
-    return {"red": red, "green": green, "blue": blue}
-
-
-@bento_cmd('set_bg')
-def set_bg_hex(red, green, blue):
-    return {"red": red, "green": green, "blue": blue}
-
-@bento_cmd('set_bg_norm')
-def set_bg_from_hsv_float(h, s, v):
-    return dict(zip(("red", "green", "blue"), colorsys.hsv_to_rgb(h, s, v)))
-
-
-@bento_cmd('set_bg_norm')
-def set_bg_from_hsv_uint(h, s, v):
-    return dict(
-        zip(("red", "green", "blue"), colorsys.hsv_to_rgb(*tuple(
-            map(lambda x: x / 255.0, (h, s, v))))))
-
-
-@bento_cmd
-def set_opacity(opacity):
-    return {"opacity": opacity}
-
-
-@bento_cmd
-def set_origin(x, y):
-    return {"x": x, "y": y}
-
-
-def set_bounds(name, x, y, width, height):
-    set_origin(name, x, y)
-    set_size(name, width, height)
-
-
-@bento_cmd
-def set_size(width, height):
-    return {"width": width, "height": height}
-
-@bento_cmd
-def repaint():
-    return {}
-
-# Bar functions
-
-def update_cpu_bar(bar_name=None):
-    if bar_name is None:
-        bar_name = 'cpu'
-
-    pc = psutil.cpu_percent()
-    set_text(bar_name,str(pc))
-    if pc > 10:
-        set_bg(bar_name,200,50,50)
-    else:
-        set_bg(bar_name,50,200,50)
-
 
 # Utilities
 
@@ -137,22 +43,110 @@ def send_to_fifo(data, fifo_path=None):
         fifo.write("{}\0".format(json.dumps(data)))
 
 
-bs = ['batt', 'date', 'cpu']
+def hex_to_rgb(value):
+    value = value.lstrip('#')
+    lv = len(value)
+    if lv == 1:
+        v = int(value, 16) * 17
+        return (v, v, v)
+    if lv == 3:
+        return tuple(int(value[i:i + 1], 16) * 17 for i in range(0, 3))
+    return tuple(int(value[i:i + lv // 3], 16) for i in range(0, lv, lv // 3))
 
 
-def initExampleBars():
-    create_bar('batt', 5, 5, 400, 22)
-    create_bar('date', 410, 5, 405, 22)
-    create_bar('cpu', 820, 5, 540, 22)
-
-    for b in bs:
-        set_font(b, 'Iosevka 11')
-        set_text(b, b)
+def canonicalize_color(value):
+    if type(value) is str:
+        value = hex_to_rgb(value)
+    return value
 
 
-def colorShow():
-    for i in range(256):
-        set_bg_from_hsv_uint('batt', i, 255, 255)
-        set_bg_from_hsv_uint('date', i + 64, 255, 255)
-        set_bg_from_hsv_uint('cpu', i + 128, 255, 255)
-        sleep(0.01)
+def bar_from_dict(*args, **kwargs):
+    bar_class = kwargs['type']
+
+    import bento.bars
+    bar_classes = {
+        'cpu': bento.bars.system.CPUBar,
+        'shell': bento.bars.ShellCommandBar,
+        'mpd': bento.bars.MPDBar
+    }
+
+    if type(bar_class) is str:
+        bar_class = bar_classes[bar_class]
+
+    kwargs.pop('type')
+
+    return bar_class(*args, **kwargs)
+
+
+def mainloop(bars, create=True):
+    try:
+        for bar in bars:
+            if create:
+                bar.create()
+            bar.start_update()
+        for bar in bars:
+            bar.wait_for_exit()
+    except KeyboardInterrupt:
+        print("Caught C-c.")
+        for bar in bars:
+            bar.stop_update()
+        print("All bars stopped.")
+
+
+def load_config_file(fname):
+    with open(fname) as f:
+        panels = yaml.load(f)
+    bars = []
+    for (panel_name, panel_data) in panels.items():
+        opts = panel_data['options']
+
+        x = opts['x']
+        if 'padding' in opts:
+            padding = opts['padding']
+        else:
+            padding = 5
+
+        for bar_opts in panel_data['bars']:
+            bar_name = bar_opts['name']
+            bar_opts.pop('name')
+            bar_opts.update(opts)
+            bar_opts.pop('x')
+            if 'padding' in bar_opts:
+                bar_opts.pop('padding')
+            if 'bar_name' in bar_opts:
+                bar_opts.pop('bar_name')
+            extra_opts = {
+                'x': x,
+                'bar_name': "{}/{}".format(panel_name, bar_name)
+            }
+            extra_opts.update(bar_opts)
+            print(extra_opts)
+
+            bar = bar_from_dict(**extra_opts)
+            bars.append(bar)
+            x = x + padding + extra_opts['width']
+    return bars
+
+
+def run_from_config():
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Load a Bento configuration.')
+    parser.add_argument(
+        '-n',
+        '--nocreate',
+        dest='create',
+        action='store_const',
+        default=True,
+        const=False,
+        help='Don\'t create the bars before starting the update loop.')
+
+    parser.add_argument(
+        '-f',
+        '--config',
+        default='bento_config.yaml',
+        help='Load a configuration file.')
+
+    args = parser.parse_args()
+    bars = load_config_file(args.config)
+    mainloop(bars, create=args.create)
